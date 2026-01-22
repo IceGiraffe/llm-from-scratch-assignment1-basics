@@ -4,6 +4,7 @@ from typing import BinaryIO
 import regex as re
 from concurrent.futures import ProcessPoolExecutor
 
+
 # copied from pretokenization_example.py
 def find_chunk_boundaries(
     file: BinaryIO,
@@ -59,14 +60,18 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 
-def remove_special_tokens_from_chunk(chunk: str, special_tokens: list[str]) -> list[str]:
-    segments = {chunk} 
-    for delimiter in special_tokens: 
-        new_segments = set() 
-        for seg in segments: 
-            new_segments.update(seg.split(delimiter)) 
-        segments = new_segments 
-    return list(segments)
+def split_with_special_tokens(chunk: str, special_tokens: list[str]) -> list[str]:
+    if not special_tokens:
+        return [chunk]
+    # Prefer longer tokens when they overlap.
+    escaped_tokens = [
+        re.escape(token) for token in sorted(special_tokens, key=len, reverse=True)
+    ]
+    pattern = "(" + "|".join(escaped_tokens) + ")"
+    parts = re.split(pattern, chunk)
+    # print(parts)
+    print(special_tokens[0] in parts)
+    return [part for part in parts if part]
 
 
 def pretokenize_string(
@@ -80,10 +85,19 @@ def pretokenize_string(
 
 def pretokenize_chunk(
     segments: list[str],
+    special_tokens: list[str],
     regex_pattern: str = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""",
 ) -> dict[tuple[bytes], int]:
     pretokenized: dict[tuple[bytes], int] = {}
     for segment in segments:
+        if segment in special_tokens:
+            token_bytes = segment.encode("utf-8")
+            token_tuple = (token_bytes,)
+            if token_tuple in pretokenized:
+                pretokenized[token_tuple] += 1
+            else:
+                pretokenized[token_tuple] = 1
+            continue
         tokens = pretokenize_string(segment, regex_pattern)
         bytes_list = [token.group(0).encode("utf-8") for token in tokens]
         tupled_list = [tupled_bytes(b) for b in bytes_list]
@@ -114,6 +128,7 @@ def initialize_vocab(
         vocab[len(special_tokens) + i] = bytes([i])
     return vocab
 
+
 def update_vocab_with_merge(
     vocab: dict[int, bytes],
     token1: bytes,
@@ -135,6 +150,7 @@ class PairCount:
             return self.pair < other.pair  # lexicographically greater
         return self.count < other.count
 
+
 def bpe_merge(
     pretokenized_chunk: dict[tuple[bytes], int],
     vocab: dict[int, bytes],
@@ -144,7 +160,7 @@ def bpe_merge(
     from collections import Counter
 
     while len(vocab) < target_vocab_size:
-        pair_counts : list[PairCount] = []
+        pair_counts: list[PairCount] = []
 
         # Count frequency of each adjacent token pair
         pair_frequency: Counter[tuple[bytes, bytes]] = Counter()
@@ -171,7 +187,10 @@ def bpe_merge(
             new_token_list = []
             i = 0
             while i < len(token_tuple):
-                if i < len(token_tuple) - 1 and (token_tuple[i], token_tuple[i + 1]) == most_frequent_pair:
+                if (
+                    i < len(token_tuple) - 1
+                    and (token_tuple[i], token_tuple[i + 1]) == most_frequent_pair
+                ):
                     new_token_list.append(token1 + token2)
                     i += 2
                 else:
@@ -186,19 +205,19 @@ def bpe_merge(
         pretokenized_chunk = new_pretokenized_chunk
 
 
-def worker(
-    args
-) -> dict[tuple[bytes], int]:
+def worker(args) -> dict[tuple[bytes], int]:
     input_path, start, end, special_tokens = args
     with open(input_path, "rb") as f:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
 
-        # remove special tokens, return list of segments, each segment is a string
-        segments = remove_special_tokens_from_chunk(chunk, special_tokens)
+        # split chunk into normal segments and preserved special tokens
+        segments = split_with_special_tokens(chunk, special_tokens)
 
         # pre-tokenization
-        pretokenized_chunk: dict[tuple[bytes], int] = pretokenize_chunk(segments)
+        pretokenized_chunk: dict[tuple[bytes], int] = pretokenize_chunk(
+            segments, special_tokens
+        )
         return pretokenized_chunk
 
 
@@ -243,13 +262,30 @@ def train_bpe(
     )
     f.close()
     print("Chunk boundaries:", boundaries)
-    with ProcessPoolExecutor() as ex:
-        results = list(ex.map(worker, [(input_path, start, end, special_tokens) for start, end in zip(boundaries[:-1], boundaries[1:])]))
-    
-    # merge results
+    num_chunks = max(1, len(boundaries) - 1)
+    max_workers = min(num_processes, num_chunks)
+
+    # 默认使用本机的CPU核数，需要指定吗 max_workers
+    # 避免默认 CPU 核数导致的启动开销
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        results = list(
+            ex.map(
+                worker,
+                [
+                    (input_path, start, end, special_tokens)
+                    for start, end in zip(boundaries[:-1], boundaries[1:])
+                ],
+            )
+        )
+
+    # merge results, 一开始是这里写错了
     pretokenized_chunk: dict[tuple[bytes], int] = {}
     for partial in results:
-        pretokenized_chunk.update(partial)
+        for token_tuple, count in partial.items():
+            if token_tuple in pretokenized_chunk:
+                pretokenized_chunk[token_tuple] += count
+            else:
+                pretokenized_chunk[token_tuple] = count
 
     print("Total unique pre-tokenized items:", len(pretokenized_chunk))
 
@@ -266,22 +302,18 @@ def train_bpe(
     print("Final vocab size:", len(vocab))
     print("Number of merges:", len(merges))
 
-
-
     return vocab, merges
 
 
-# if __name__ == "__main__":
-#     vocab, merges = train_bpe(
-#         input_path="data/TinyStoriesV2-GPT4-valid.txt",
-#         vocab_size=1000,
-#         special_tokens=["<|endoftext|>"],
-#     )
-#     print("Trained vocabulary:")
-#     for token_id, token_bytes in vocab.items():
-#         print(f"{token_id}: {token_bytes}")
-#     print("\nTrained merges:")
-#     for token1, token2 in merges:
-#         print(f"({token1}, {token2})")
-
-    
+if __name__ == "__main__":
+    vocab, merges = train_bpe(
+        input_path="data/TinyStoriesV2-GPT4-valid.txt",
+        vocab_size=1000,
+        special_tokens=["<|endoftext|>"],
+    )
+    print("Trained vocabulary:")
+    for token_id, token_bytes in vocab.items():
+        print(f"{token_id}: {token_bytes}")
+    print("\nTrained merges:")
+    for token1, token2 in merges:
+        print(f"({token1}, {token2})")
