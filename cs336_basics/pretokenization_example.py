@@ -10,6 +10,7 @@ def find_chunk_boundaries(
     """
     Chunk the file into parts that can be counted independently.
     May return fewer chunks if the boundaries end up overlapping.
+    All chunks start with spilit_special_token except the first chunk.
     """
     assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
 
@@ -24,7 +25,7 @@ def find_chunk_boundaries(
     # Chunks start on previous index, don't include last index
     chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
     chunk_boundaries[-1] = file_size
-
+    print(chunk_boundaries)
     mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
 
     for bi in range(1, len(chunk_boundaries) - 1):
@@ -50,7 +51,7 @@ def find_chunk_boundaries(
 
 
 ## Usage
-with open(..., "rb") as f:
+with open("data/TinyStoriesV2-GPT4-train.txt", "rb") as f:
     num_processes = 4
     boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
 
