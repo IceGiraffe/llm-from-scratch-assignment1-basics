@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import heapq
 import os
 from typing import BinaryIO
 import regex as re
@@ -69,8 +70,6 @@ def split_with_special_tokens(chunk: str, special_tokens: list[str]) -> list[str
     ]
     pattern = "(" + "|".join(escaped_tokens) + ")"
     parts = re.split(pattern, chunk)
-    # print(parts)
-    print(special_tokens[0] in parts)
     return [part for part in parts if part]
 
 
@@ -147,8 +146,8 @@ class PairCount:
 
     def __lt__(self, other: "PairCount") -> bool:
         if self.count == other.count:
-            return self.pair < other.pair  # lexicographically greater
-        return self.count < other.count
+            return self.pair > other.pair  # lexicographically greater
+        return self.count > other.count
 
 
 def bpe_merge(
@@ -159,50 +158,134 @@ def bpe_merge(
 ) -> None:
     from collections import Counter
 
+    def iter_pairs(tokens: tuple[bytes]) -> list[tuple[bytes, bytes]]:
+        return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
+
+    def merge_tokens(
+        tokens: tuple[bytes],
+        pair: tuple[bytes, bytes],
+        merged_token: bytes,
+        modified_pairs: set[tuple[bytes, bytes]],
+        pair_frequency: Counter[tuple[bytes, bytes]]
+    ) -> tuple[tuple[bytes], bool]:
+        new_tokens: list[bytes] = []
+        i = 0
+        changed = False
+        while i < len(tokens):
+            if i < len(tokens) - 1 and (tokens[i], tokens[i + 1]) == pair:
+                new_tokens.append(merged_token)
+                if i > 0:
+                    left_pair = (tokens[i - 1], tokens[i])
+                    updated = pair_frequency[left_pair] - freq
+                    if updated <= 0:
+                        pair_frequency.pop(left_pair, None)
+                    else:
+                        pair_frequency[left_pair] = updated
+                    modified_pairs.add(left_pair)
+
+                    new_pair = (tokens[i - 1], merged_token)
+                    pair_frequency[new_pair] = pair_frequency.get(new_pair, 0) + freq
+                    modified_pairs.add(new_pair)
+                if i + 2 < len(tokens):
+                    right_pair = (tokens[i + 1], tokens[i + 2])
+                    updated = pair_frequency[right_pair] - freq
+                    if updated <= 0:
+                        pair_frequency.pop(right_pair, None)
+                    else:
+                        pair_frequency[right_pair] = updated
+                    modified_pairs.add(right_pair)
+
+                    new_pair = (merged_token, tokens[i + 2])
+                    pair_frequency[new_pair] = pair_frequency.get(new_pair, 0) + freq
+                    modified_pairs.add(new_pair)
+                i += 2
+                changed = True
+            else:
+                new_tokens.append(tokens[i])
+                i += 1
+        return tuple(new_tokens), changed
+
+    # Count frequency of each adjacent token pair
+    pair_frequency: Counter[tuple[bytes, bytes]] = Counter()
+    for token_tuple, freq in pretokenized_chunk.items():
+        for pair in iter_pairs(token_tuple):
+            pair_frequency[pair] += freq
+
+    pair_counts: list[PairCount] = [
+        PairCount(pair, count) for pair, count in pair_frequency.items()
+    ]
+
+    # 维护一个PairCount的堆
+    heapq.heapify(pair_counts)
+
     while len(vocab) < target_vocab_size:
-        pair_counts: list[PairCount] = []
+        most_frequent_pair: tuple[bytes, bytes] | None = None
+        while pair_counts:
+            cur_item = heapq.heappop(pair_counts)
+            current_count = pair_frequency.get(cur_item.pair, 0)
+            if cur_item.count != current_count:
+                # 说明这个pair的count已经过时了，跳过
+                continue
+            if current_count == 0:
+                continue
+            most_frequent_pair = cur_item.pair
+            break
+        if most_frequent_pair is None:
+            break
 
-        # Count frequency of each adjacent token pair
-        pair_frequency: Counter[tuple[bytes, bytes]] = Counter()
-        for token_tuple, freq in pretokenized_chunk.items():
-            for i in range(len(token_tuple) - 1):
-                pair = (token_tuple[i], token_tuple[i + 1])
-                pair_frequency[pair] += freq
-        for pair, count in pair_frequency.items():
-            pair_counts.append(PairCount(pair, count))
-        pair_counts.sort(reverse=True)
-
-        most_frequent_pair, _ = pair_counts[0].pair, pair_counts[0].count
-        # print(most_frequent_pair, _)
         token1, token2 = most_frequent_pair
 
         # Create new token and update vocab
-        new_token_id = update_vocab_with_merge(vocab, token1, token2)
-        # print(new_token_id)
+        update_vocab_with_merge(vocab, token1, token2)
         merges.append((token1, token2))
 
-        # Update pretokenized_chunk with the new merged token
-        new_pretokenized_chunk: dict[tuple[bytes], int] = {}
-        for token_tuple, freq in pretokenized_chunk.items():
-            new_token_list = []
-            i = 0
-            while i < len(token_tuple):
-                if (
-                    i < len(token_tuple) - 1
-                    and (token_tuple[i], token_tuple[i + 1]) == most_frequent_pair
-                ):
-                    new_token_list.append(token1 + token2)
-                    i += 2
-                else:
-                    new_token_list.append(token_tuple[i])
-                    i += 1
-            new_token_tuple = tuple(new_token_list)
-            if new_token_tuple in new_pretokenized_chunk:
-                new_pretokenized_chunk[new_token_tuple] += freq
-            else:
-                new_pretokenized_chunk[new_token_tuple] = freq
+        merged_token = token1 + token2
 
-        pretokenized_chunk = new_pretokenized_chunk
+        new_pretokenized: dict[tuple[bytes], int] = {}
+        modified_pairs: set[tuple[bytes, bytes]] = set()
+
+        for token_tuple, freq in pretokenized_chunk.items():
+            if len(token_tuple) < 2:
+                new_pretokenized[token_tuple] = (
+                    new_pretokenized.get(token_tuple, 0) + freq
+                )
+                continue
+
+            merged_tuple, changed = merge_tokens(
+                token_tuple, most_frequent_pair, merged_token, modified_pairs, pair_frequency
+            )
+            pair_frequency[most_frequent_pair] = 0
+            modified_pairs.add(most_frequent_pair)
+            if not changed:
+                new_pretokenized[token_tuple] = (
+                    new_pretokenized.get(token_tuple, 0) + freq
+                )
+                continue
+
+            # old_pairs = iter_pairs(token_tuple)
+            # for pair in old_pairs:
+            #     updated = pair_frequency[pair] - freq
+            #     if updated <= 0:
+            #         pair_frequency.pop(pair, None)
+            #     else:
+            #         pair_frequency[pair] = updated
+            #     modified_pairs.add(pair)
+
+            # new_pairs = iter_pairs(merged_tuple)
+            # for pair in new_pairs:
+            #     pair_frequency[pair] = pair_frequency.get(pair, 0) + freq
+            #     modified_pairs.add(pair)
+
+            new_pretokenized[merged_tuple] = (
+                new_pretokenized.get(merged_tuple, 0) + freq
+            )
+
+        pretokenized_chunk = new_pretokenized
+
+        for pair in modified_pairs:
+            count = pair_frequency.get(pair, 0)
+            if count > 0:
+                heapq.heappush(pair_counts, PairCount(pair, count))
 
 
 def worker(args) -> dict[tuple[bytes], int]:
