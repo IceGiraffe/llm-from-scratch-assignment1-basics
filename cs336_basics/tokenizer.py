@@ -1,5 +1,5 @@
 from typing import Iterable, Iterator
-from .train_bpe import pretokenize_string, tupled_bytes, split_with_special_tokens
+from .bpe_utils import pretokenize_string, tupled_bytes, split_with_special_tokens
 
 class Tokenizer:
     def __init__(
