@@ -166,43 +166,67 @@ def bpe_merge(
         pair: tuple[bytes, bytes],
         merged_token: bytes,
         modified_pairs: set[tuple[bytes, bytes]],
-        pair_frequency: Counter[tuple[bytes, bytes]]
+        pair_frequency: Counter[tuple[bytes, bytes]],
+        freq: int,
     ) -> tuple[tuple[bytes], bool]:
         new_tokens: list[bytes] = []
         i = 0
         changed = False
-        while i < len(tokens):
-            if i < len(tokens) - 1 and (tokens[i], tokens[i + 1]) == pair:
-                new_tokens.append(merged_token)
-                if i > 0:
-                    left_pair = (tokens[i - 1], tokens[i])
-                    updated = pair_frequency[left_pair] - freq
-                    if updated <= 0:
-                        pair_frequency.pop(left_pair, None)
-                    else:
-                        pair_frequency[left_pair] = updated
-                    modified_pairs.add(left_pair)
-
-                    new_pair = (tokens[i - 1], merged_token)
-                    pair_frequency[new_pair] = pair_frequency.get(new_pair, 0) + freq
-                    modified_pairs.add(new_pair)
-                if i + 2 < len(tokens):
-                    right_pair = (tokens[i + 1], tokens[i + 2])
-                    updated = pair_frequency[right_pair] - freq
-                    if updated <= 0:
-                        pair_frequency.pop(right_pair, None)
-                    else:
-                        pair_frequency[right_pair] = updated
-                    modified_pairs.add(right_pair)
-
-                    new_pair = (merged_token, tokens[i + 2])
-                    pair_frequency[new_pair] = pair_frequency.get(new_pair, 0) + freq
-                    modified_pairs.add(new_pair)
+        merge_positions: list[int] = []
+        while i < len(tokens) - 1:
+            if (tokens[i], tokens[i + 1]) == pair:
+                merge_positions.append(i)
                 i += 2
-                changed = True
+            else:
+                i += 1
+
+        if not merge_positions:
+            return tokens, False
+
+        merge_pos_set = set(merge_positions)
+
+        # Build merged token sequence
+        i = 0
+        while i < len(tokens):
+            if i in merge_pos_set:
+                new_tokens.append(merged_token)
+                i += 2
             else:
                 new_tokens.append(tokens[i])
                 i += 1
+        changed = True
+
+        def adjust_pair(pair_item: tuple[bytes, bytes], delta: int) -> None:
+            updated = pair_frequency.get(pair_item, 0) + delta
+            if updated <= 0:
+                pair_frequency.pop(pair_item, None)
+            else:
+                pair_frequency[pair_item] = updated
+            modified_pairs.add(pair_item)
+
+        for idx in merge_positions:
+            prev_merge = (idx - 2) in merge_pos_set
+            next_merge = (idx + 2) in merge_pos_set
+
+            # Remove the merged pair occurrence
+            adjust_pair(pair, -freq)
+
+            # Left neighbor: only update if no previous merge (avoid double update)
+            if idx > 0 and not prev_merge:
+                left_pair = (tokens[idx - 1], tokens[idx])
+                adjust_pair(left_pair, -freq)
+                new_left_pair = (tokens[idx - 1], merged_token)
+                adjust_pair(new_left_pair, freq)
+
+            # Right neighbor: always remove old right pair if it exists
+            if idx + 2 < len(tokens):
+                right_pair = (tokens[idx + 1], tokens[idx + 2])
+                adjust_pair(right_pair, -freq)
+
+                right_neighbor = merged_token if next_merge else tokens[idx + 2]
+                new_right_pair = (merged_token, right_neighbor)
+                adjust_pair(new_right_pair, freq)
+
         return tuple(new_tokens), changed
 
     # Count frequency of each adjacent token pair
@@ -252,10 +276,13 @@ def bpe_merge(
                 continue
 
             merged_tuple, changed = merge_tokens(
-                token_tuple, most_frequent_pair, merged_token, modified_pairs, pair_frequency
+                token_tuple,
+                most_frequent_pair,
+                merged_token,
+                modified_pairs,
+                pair_frequency,
+                freq,
             )
-            pair_frequency[most_frequent_pair] = 0
-            modified_pairs.add(most_frequent_pair)
             if not changed:
                 new_pretokenized[token_tuple] = (
                     new_pretokenized.get(token_tuple, 0) + freq
